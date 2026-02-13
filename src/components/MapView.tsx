@@ -21,17 +21,6 @@ function getDominantColor(dominantDenom: string): string {
   return d?.color ?? "#64748b";
 }
 
-// Pick heatmap gradient color based on filtered denominations
-function getHeatmapColor(
-  items: { denominationId: string }[],
-  selectedDenominations: Set<string>
-): string {
-  const denomIds = new Set(items.map((l) => l.denominationId));
-  if (denomIds.size === 1) return getDenominationColor([...denomIds][0]);
-  if (selectedDenominations.size === 1) return getDenominationColor([...selectedDenominations][0]);
-  return "#3b82f6"; // default blue
-}
-
 // Build monochrome gradient: dark -> color -> white
 function buildMonoGradient(baseColor: string): Record<number, string> {
   const n = parseInt(baseColor.slice(1), 16);
@@ -56,7 +45,7 @@ export default function MapView({
   const mapRef = useRef<L.Map | null>(null);
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const markersLayerRef = useRef<L.LayerGroup | null>(null);
-  const heatLayerRef = useRef<L.Layer | null>(null);
+  const heatLayersRef = useRef<L.Layer[]>([]);
   const choroplethLayerRef = useRef<L.LayerGroup | null>(null);
   const [mapReady, setMapReady] = useState(false);
 
@@ -104,10 +93,10 @@ export default function MapView({
       map.removeLayer(markersLayerRef.current);
       markersLayerRef.current = null;
     }
-    if (heatLayerRef.current) {
-      map.removeLayer(heatLayerRef.current);
-      heatLayerRef.current = null;
+    for (const hl of heatLayersRef.current) {
+      map.removeLayer(hl);
     }
+    heatLayersRef.current = [];
     if (choroplethLayerRef.current) {
       map.removeLayer(choroplethLayerRef.current);
       choroplethLayerRef.current = null;
@@ -222,39 +211,48 @@ export default function MapView({
       markersLayerRef.current = markersGroup;
     }
 
-    // Heatmap layer with per-denomination normalization
+    // Heatmap: one layer per denomination so colors overlap for comparison
     if (showHeatmap && filteredCensus.length > 0) {
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       require("leaflet.heat");
-      const baseColor = getHeatmapColor(filteredCensus, selectedDenominations);
-      const gradient = buildMonoGradient(baseColor);
 
-      // Normalize intensity per-denomination so each religion's peak = 1.0
-      // Without this, small religions (Sikh, Hindu, Buddhist) are invisible
-      // next to Catholic/Baptist which have 10-50x more points.
-      const CELL = 0.5;
-      const cellCounts = new Map<string, number>();
+      // Group points by denomination
+      const byDenom = new Map<string, CensusPopulationPoint[]>();
       for (const p of filteredCensus) {
-        const cellKey = `${p.denominationId}|${Math.round(p.lat / CELL)},${Math.round(p.lng / CELL)}`;
-        cellCounts.set(cellKey, (cellCounts.get(cellKey) || 0) + 1);
-      }
-      const denomCellMax = new Map<string, number>();
-      for (const [key, count] of cellCounts.entries()) {
-        const denomId = key.split("|")[0];
-        denomCellMax.set(denomId, Math.max(denomCellMax.get(denomId) || 0, count));
+        let arr = byDenom.get(p.denominationId);
+        if (!arr) { arr = []; byDenom.set(p.denominationId, arr); }
+        arr.push(p);
       }
 
-      const heatData = filteredCensus.map((p) => {
-        const cellKey = `${p.denominationId}|${Math.round(p.lat / CELL)},${Math.round(p.lng / CELL)}`;
-        const localCount = cellCounts.get(cellKey) || 1;
-        const maxForDenom = denomCellMax.get(p.denominationId) || 1;
-        const intensity = Math.max(0.1, localCount / maxForDenom);
-        return [p.lat, p.lng, intensity] as [number, number, number];
-      });
+      // Per-denomination cell density for normalization
+      const CELL = 0.5;
 
-      const layer = L.heatLayer(heatData, { radius: 30, blur: 25, maxZoom: 10, max: 1, minOpacity: 0.15, gradient });
-      layer.addTo(map);
-      heatLayerRef.current = layer;
+      for (const [denomId, points] of byDenom.entries()) {
+        const baseColor = getDenominationColor(denomId);
+        const gradient = buildMonoGradient(baseColor);
+
+        // Compute cell density for this denomination
+        const cellCounts = new Map<string, number>();
+        for (const p of points) {
+          const cellKey = `${Math.round(p.lat / CELL)},${Math.round(p.lng / CELL)}`;
+          cellCounts.set(cellKey, (cellCounts.get(cellKey) || 0) + 1);
+        }
+        let maxCell = 1;
+        for (const c of cellCounts.values()) {
+          if (c > maxCell) maxCell = c;
+        }
+
+        const heatData = points.map((p) => {
+          const cellKey = `${Math.round(p.lat / CELL)},${Math.round(p.lng / CELL)}`;
+          const localCount = cellCounts.get(cellKey) || 1;
+          const intensity = Math.max(0.1, localCount / maxCell);
+          return [p.lat, p.lng, intensity] as [number, number, number];
+        });
+
+        const layer = L.heatLayer(heatData, { radius: 30, blur: 25, maxZoom: 10, max: 1, minOpacity: 0.12, gradient });
+        layer.addTo(map);
+        heatLayersRef.current.push(layer);
+      }
     }
 
   }, [selectedDenominations, showMarkers, showHeatmap, showChoropleth, countyData, censusPoints, mapReady]);
